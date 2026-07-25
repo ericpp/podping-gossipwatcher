@@ -792,9 +792,9 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("  Trusted monitors: {}", trusted_monitors.read().unwrap().len());
 
-    // Start SSE server if enabled
+    // Create SSE broadcast channel (server starts later once node info is ready)
     let sse_tx: Option<tokio::sync::broadcast::Sender<String>> = if sse_enabled {
-        Some(sse::start_sse_server(sse_bind_addr, sse_buffer_size))
+        Some(tokio::sync::broadcast::channel::<String>(sse_buffer_size).0)
     } else {
         None
     };
@@ -814,8 +814,34 @@ async fn main() -> anyhow::Result<()> {
     //Self assign an Iroh node id
     let my_node_id = endpoint.id();
     let peer_names: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
+    let active_peers: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
     println!("  Iroh Node ID: {}", my_node_id);
     println!("  Sender pubkey: {}", pubkey_hex);
+
+    let broadcast_failures = Arc::new(AtomicU64::new(0));
+    let notifications_received = Arc::new(AtomicU64::new(0));
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let last_notification_time = Arc::new(AtomicU64::new(now_secs));
+
+    // Start web UI + SSE server if enabled
+    if let Some(ref tx) = sse_tx {
+        sse::start_web_server(sse_bind_addr, sse::AppState {
+            sse_tx: tx.clone(),
+            notifications_received: notifications_received.clone(),
+            broadcast_failures: broadcast_failures.clone(),
+            last_notification_time: last_notification_time.clone(),
+            peer_names: peer_names.clone(),
+            active_peers: active_peers.clone(),
+            trusted_publishers: trusted_publishers.clone(),
+            node_id: my_node_id.to_string(),
+            pubkey: pubkey_hex.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            friendly_name: friendly_name.clone(),
+            archive_db: db.clone(),
+            rebootstrap_timeout: REBOOTSTRAP_TIMEOUT,
+            start_time: now_secs,
+        });
+    }
 
     //Launch Iroh modules
     let gossip = Gossip::builder()
@@ -848,11 +874,10 @@ async fn main() -> anyhow::Result<()> {
     // Shared sender so all tasks use the same sender (and reconnect can replace it)
     let shared_sender: Arc<tokio::sync::RwLock<GossipSender>> =
         Arc::new(tokio::sync::RwLock::new(gossip_sender));
+
     // Track the current Gossip actor so reconnect can shut down the old one
     let shared_gossip: Arc<tokio::sync::RwLock<Gossip>> =
         Arc::new(tokio::sync::RwLock::new(gossip));
-    let broadcast_failures = Arc::new(AtomicU64::new(0));
-    let notifications_received = Arc::new(AtomicU64::new(0));
     let reconnect_count = Arc::new(AtomicU64::new(0));
     let neighbor_count = Arc::new(AtomicU32::new(0));
     let neighbor_ids: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
@@ -1100,6 +1125,7 @@ async fn main() -> anyhow::Result<()> {
         let reconnect_trusted_file = trusted_publishers_file.clone();
         let reconnect_last_notif = last_notification_time.clone();
         let reconnect_peer_names = peer_names.clone();
+        let reconnect_active_peers = active_peers.clone();
         let reconnect_db = db.clone();
         let reconnect_sse_tx = sse_tx.clone();
         let reconnect_notif_count = notifications_received.clone();
@@ -1245,6 +1271,7 @@ async fn main() -> anyhow::Result<()> {
                                     reconnect_db.clone(),
                                     Arc::new(Mutex::new(None)),
                                     reconnect_peer_names.clone(),
+                                    reconnect_active_peers.clone(),
                                     reconnect_sse_tx.clone(),
                                     reconnect_notif_count.clone(),
                                     reconnect_failures.clone(),
@@ -1265,6 +1292,7 @@ async fn main() -> anyhow::Result<()> {
                                 reconnect_neighbor_ids.write().unwrap().clear();
                                 // Reset neighbor count
                                 reconnect_neighbor_count.store(0, Ordering::Relaxed);
+                                reconnect_active_peers.write().unwrap().clear();
                                 last_reconnect = std::time::Instant::now();
                                 reconnect_counter.fetch_add(1, Ordering::Relaxed);
                                 // Don't reset consecutive_reconnects here — wait for the
@@ -1452,6 +1480,7 @@ async fn main() -> anyhow::Result<()> {
         db.clone(),
         neighbor_tx_for_event.clone(),
         peer_names.clone(),
+        active_peers.clone(),
         sse_tx.clone(),
         notifications_received.clone(),
         broadcast_failures.clone(),
@@ -1492,7 +1521,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 //Incoming Iroh gossip event handler
-fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<Arc<Mutex<archive::Archive>>>, neighbor_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>>, peer_names: &Arc<RwLock<HashMap<String, String>>>, sse_tx: &Option<tokio::sync::broadcast::Sender<String>>, notifications_received: &Arc<AtomicU64>, last_seq_per_sender: &Arc<Mutex<HashMap<String, u64>>>) {
+fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<Arc<Mutex<archive::Archive>>>, neighbor_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>>, peer_names: &Arc<RwLock<HashMap<String, String>>>, active_peers: &Arc<RwLock<HashSet<String>>>, sse_tx: &Option<tokio::sync::broadcast::Sender<String>>, notifications_received: &Arc<AtomicU64>, last_seq_per_sender: &Arc<Mutex<HashMap<String, u64>>>) {
     match event {
         Event::Received(msg) => {
             let raw = &msg.content[..];
@@ -1679,6 +1708,7 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
         }
         Event::NeighborUp(node_id) => {
             let node_str = node_id.to_string();
+            active_peers.write().unwrap().insert(node_str.clone());
             let display = {
                 let names = peer_names.read().unwrap();
                 match names.get(&node_str) {
@@ -1698,6 +1728,7 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
         }
         Event::NeighborDown(node_id) => {
             let node_str = node_id.to_string();
+            active_peers.write().unwrap().remove(&node_str);
             let display = {
                 let names = peer_names.read().unwrap();
                 match names.get(&node_str) {
@@ -1940,6 +1971,7 @@ fn spawn_receive_task(
     db: Option<Arc<Mutex<archive::Archive>>>,
     neighbor_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>>,
     peer_names: Arc<RwLock<HashMap<String, String>>>,
+    active_peers: Arc<RwLock<HashSet<String>>>,
     sse_tx: Option<tokio::sync::broadcast::Sender<String>>,
     notifications_received: Arc<AtomicU64>,
     reconnect_failures: Arc<AtomicU64>,
@@ -2057,6 +2089,7 @@ fn spawn_receive_task(
                     &db,
                     &neighbor_tx,
                     &peer_names,
+                    &active_peers,
                     &sse_tx,
                     &notifications_received,
                     &last_seq_per_sender,

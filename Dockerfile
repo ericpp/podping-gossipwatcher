@@ -51,6 +51,12 @@ RUN mkdir -p /data/gossip /opt/podping-gossipwatcher \
 
 WORKDIR /opt/podping-gossipwatcher
 COPY --from=builder /src/target/release/podping-gossipwatcher /opt/podping-gossipwatcher/podping-gossipwatcher
+COPY --from=builder /src/podping-gossipwatcher/src/web_ui.html /opt/podping-gossipwatcher/web_ui.html
+
+RUN mkdir -p /data && chown 1000:1000 /data
+WORKDIR /data
+
+ENV SSE_ENABLED=1
 
 USER 1000
 EXPOSE 8089

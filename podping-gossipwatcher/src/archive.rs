@@ -108,4 +108,11 @@ impl Archive {
 
         Ok(result.map(|ts| ts as u64))
     }
+
+    pub fn message_count(&self) -> Result<u64, Box<dyn Error>> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
 }
