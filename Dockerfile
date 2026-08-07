@@ -7,16 +7,20 @@ RUN apt-get update \
         libssl-dev \
         pkg-config \
         gcc-aarch64-linux-gnu \
+        gcc-arm-linux-gnueabihf \
         gcc-x86-64-linux-gnu \
         libc6-dev-arm64-cross \
+        libc6-dev-armhf-cross \
         libc6-dev-amd64-cross \
     && rm -rf /var/lib/apt/lists/*
 
-RUN rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+RUN rustup target add aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf x86_64-unknown-linux-gnu
 
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
 ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+ENV CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc
 ENV CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc
 
 WORKDIR /src
@@ -26,6 +30,8 @@ COPY podping-gossipwatcher /src/podping-gossipwatcher
 
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
         RUST_TARGET=aarch64-unknown-linux-gnu; \
+    elif [ "$TARGETARCH" = "arm" ]; then \
+        RUST_TARGET=armv7-unknown-linux-gnueabihf; \
     else \
         RUST_TARGET=x86_64-unknown-linux-gnu; \
     fi \
