@@ -890,10 +890,6 @@ async fn main() -> anyhow::Result<()> {
     let force_endpoint_reset = Arc::new(AtomicBool::new(false));
     let receive_generation = Arc::new(AtomicU64::new(0));
 
-    // --- Re-bootstrap watchdog timer ---
-    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let last_notification_time = Arc::new(AtomicU64::new(now_secs));
-
     //Periodically announce ourselves to the topic for the bootstrapping benefit of others
     let peer_announce_interval: u64 = env::var("PEER_ANNOUNCE_INTERVAL")
         .ok()
