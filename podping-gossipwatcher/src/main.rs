@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::io::Write;
-use std::os::unix::io::FromRawFd;
+use std::sync::OnceLock;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_lite::StreamExt;
 use iroh::protocol::Router;
@@ -58,19 +58,77 @@ const RSS_CEILING_BYTES: u64 = 1024 * 1024 * 1024;   // 1 GB RSS ceiling — saf
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
 const JOIN_PEERS_TIMEOUT_SECS: u64 = 10;
 
-/// Read process resident set size in bytes. Returns 0 on non-Linux or read failure.
-fn read_rss_bytes() -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
-            if let Some(pages) = s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()) {
-                return pages * 4096;
-            }
+/// Shared sysinfo `System` instance. Kept across calls so CPU-usage deltas
+/// (which need at least two samples) work, and to avoid re-allocating on
+/// every metrics read.
+fn process_system() -> &'static std::sync::Mutex<sysinfo::System> {
+    static SYS: OnceLock<std::sync::Mutex<sysinfo::System>> = OnceLock::new();
+    SYS.get_or_init(|| std::sync::Mutex::new(sysinfo::System::new()))
+}
+
+/// Refresh CPU + memory for our own process and run `f` with the refreshed
+/// `Process`. Returns `None` if the pid could not be resolved or the process
+/// disappeared. Locks the shared `System`.
+fn with_self_process<T>(f: impl FnOnce(&sysinfo::Process) -> T) -> Option<T> {
+    let pid = sysinfo::get_current_pid().ok()?;
+    let mtx = process_system();
+    let mut sys = mtx.lock().unwrap_or_else(|p| p.into_inner());
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing()
+            .with_cpu()
+            .with_memory(),
+    );
+    sys.process(pid).map(f)
+}
+
+/// Resolve trace output path: `TRACE_FILE` wins; on Unix, `TRACE_FD3=1` uses
+/// `/dev/fd/3` (for shell usage like `3>trace.log`).
+fn trace_output_path() -> Option<String> {
+    if let Ok(path) = env::var("TRACE_FILE") {
+        let path = path.trim().to_string();
+        if !path.is_empty() {
+            return Some(path);
         }
-        0
     }
-    #[cfg(not(target_os = "linux"))]
-    { 0 }
+    #[cfg(unix)]
+    if env::var("TRACE_FD3").as_deref() == Ok("1") {
+        return Some("/dev/fd/3".to_string());
+    }
+    None
+}
+
+fn open_trace_writer() -> Box<dyn std::io::Write + Send + Sync> {
+    let Some(path) = trace_output_path() else {
+        return Box::new(std::io::stderr());
+    };
+
+    let is_dev_fd = path.starts_with("/dev/fd/");
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true);
+    if !is_dev_fd {
+        opts.create(true).append(true);
+    }
+
+    match opts.open(&path) {
+        Ok(file) => {
+            eprintln!("  Tracing to {}", path);
+            Box::new(file)
+        }
+        Err(e) => {
+            eprintln!(
+                "\x1b[35m[WARN] Failed to open trace output {}: {}; using stderr\x1b[0m",
+                path, e
+            );
+            Box::new(std::io::stderr())
+        }
+    }
+}
+
+/// Read process resident set size in bytes. Returns 0 on failure.
+fn read_rss_bytes() -> u64 {
+    with_self_process(|p| p.memory()).unwrap_or(0)
 }
 const ARCHIVE_SYNC_ALPN: &[u8] = b"/podping-archive-sync/1";
 const DEFAULT_SSE_BIND_ADDR: &str = "0.0.0.0:8089";
@@ -265,51 +323,21 @@ impl PeerAnnounce {
         }
     }
 
-    /// Read CPU usage, RSS memory, and thread count from /proc/self.
+    /// Read CPU usage, RSS memory (MB), and thread count for our own process.
+    /// Portable across Linux, macOS, and Windows via the `sysinfo` crate.
+    ///
+    /// CPU is the sample since the previous refresh (roughly, since the last
+    /// call to `with_self_process` — see `process_system`), so on the very
+    /// first call it will read ~0.0%. Thread count comes from `Process::tasks`
+    /// and may be `None` on platforms where sysinfo does not expose it.
     fn gather_metrics() -> (Option<f32>, Option<u64>, Option<u32>) {
-        let thread_count = fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("Threads:"))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|v| v.parse::<u32>().ok())
-            });
-
-        let memory_mb = fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("VmRSS:"))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|kb| kb / 1024)
-            });
-
-        // CPU: read /proc/self/stat for utime+stime ticks, divide by uptime
-        let cpu_percent = (|| {
-            let stat = fs::read_to_string("/proc/self/stat").ok()?;
-            let fields: Vec<&str> = stat.rsplit(')').next()?.split_whitespace().collect();
-            // fields[11] = utime, fields[12] = stime (0-indexed after the closing paren)
-            let utime: u64 = fields.get(11)?.parse().ok()?;
-            let stime: u64 = fields.get(12)?.parse().ok()?;
-            let total_ticks = utime + stime;
-
-            let uptime_str = fs::read_to_string("/proc/uptime").ok()?;
-            let uptime_secs: f64 = uptime_str.split_whitespace().next()?.parse().ok()?;
-
-            let start_time: u64 = fields.get(19)?.parse().ok()?;
-            let ticks_per_sec: u64 = 100; // sysconf(_SC_CLK_TCK), almost always 100
-            let process_secs = uptime_secs - (start_time as f64 / ticks_per_sec as f64);
-
-            if process_secs > 0.0 {
-                Some((total_ticks as f64 / ticks_per_sec as f64 / process_secs * 100.0) as f32)
-            } else {
-                None
-            }
-        })();
-
-        (cpu_percent, memory_mb, thread_count)
+        with_self_process(|p| {
+            let cpu_percent = Some(p.cpu_usage());
+            let memory_mb = Some(p.memory() / (1024 * 1024));
+            let thread_count = p.tasks().map(|t| t.len() as u32);
+            (cpu_percent, memory_mb, thread_count)
+        })
+        .unwrap_or((None, None, None))
     }
 
     fn canonical_endorse_bytes(&self) -> Vec<u8> {
@@ -640,24 +668,12 @@ async fn run_catchup(
 //Main ---------------------------------------------------------------------------------------------
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Write tracing output to fd 3 only if TRACE_FD3=1 and fd 3 is a pipe or
-    // regular file, otherwise stderr. Uses a non-blocking writer so log spam
-    // (e.g., iroh path exhaustion retries) can't starve the tokio runtime.
-    // Usage: TRACE_FD3=1 RUST_LOG=debug ./gossip-listener 3>trace.log
-    let trace_writer: Box<dyn std::io::Write + Send + Sync> = unsafe {
-        let mut stat: libc::stat = std::mem::zeroed();
-        let fd3_ok = env::var("TRACE_FD3").as_deref() == Ok("1")
-            && libc::fstat(3, &mut stat) == 0
-            && {
-                let ft = stat.st_mode & libc::S_IFMT;
-                ft == libc::S_IFIFO || ft == libc::S_IFREG
-            };
-        if fd3_ok {
-            Box::new(std::fs::File::from_raw_fd(3))
-        } else {
-            Box::new(std::io::stderr())
-        }
-    };
+    // Write tracing output to TRACE_FILE, or on Unix TRACE_FD3=1 via /dev/fd/3,
+    // otherwise stderr. Uses a non-blocking writer so log spam (e.g., iroh path
+    // exhaustion retries) can't starve the tokio runtime.
+    // Usage: TRACE_FILE=trace.log RUST_LOG=debug ./podping-gossipwatcher
+    //    or: TRACE_FD3=1 RUST_LOG=debug ./podping-gossipwatcher 3>trace.log
+    let trace_writer = open_trace_writer();
     let (non_blocking, _guard) = tracing_appender::non_blocking(trace_writer);
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -1524,9 +1540,12 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
             // Try PeerAnnounce first
             if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(raw) {
                 if announce.msg_type == "peer_announce" {
-                    let metrics_str = match (announce.cpu_percent, announce.memory_mb, announce.thread_count) {
-                        (Some(cpu), Some(mem), Some(thr)) => {
-                            let mut s = format!(" [cpu={:.1}% mem={}MB thr={}", cpu, mem, thr);
+                    let metrics_str = match (announce.cpu_percent, announce.memory_mb) {
+                        (Some(cpu), Some(mem)) => {
+                            let mut s = format!(" [cpu={:.1}% mem={}MB", cpu, mem);
+                            if let Some(thr) = announce.thread_count {
+                                s.push_str(&format!(" thr={}", thr));
+                            }
                             if let Some(n) = announce.neighbor_count { s.push_str(&format!(" nbr={}", n)); }
                             if let Some(up) = announce.uptime_secs {
                                 let hours = up / 3600;
