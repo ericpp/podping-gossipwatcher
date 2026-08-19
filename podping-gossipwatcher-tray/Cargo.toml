@@ -1,0 +1,33 @@
+[package]
+name = "podping-gossipwatcher-tray"
+version = "0.1.0"
+authors = ["Dave Jones"]
+edition = "2021"
+description = "Windows-only system-tray wrapper for podping-gossipwatcher"
+
+[[bin]]
+name = "podping-gossipwatcher-tray"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.28"
+tray-icon = "0.19"
+muda = "0.15"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+open = "5"
+anyhow = "1"
+directories = "5"
+raw-window-handle = "0.6"
+rfd = "0.15"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+]

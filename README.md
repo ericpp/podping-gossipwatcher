@@ -83,6 +83,29 @@ cargo build --release --locked -p podping-gossipwatcher
 ./target/release/podping-gossipwatcher
 ```
 
+### Windows tray app + installer
+
+The tray app (`podping-gossipwatcher-tray`) is a Windows-only wrapper that
+manages the watcher process, stores settings under
+`%APPDATA%\PodpingGossipWatcher\`, and exposes SSE on localhost.
+
+Build both binaries:
+
+```powershell
+cargo build --release --locked -p podping-gossipwatcher -p podping-gossipwatcher-tray
+```
+
+Create a setup executable (requires [NSIS](https://nsis.sourceforge.io/Download)):
+
+```powershell
+.\installer\build.ps1
+```
+
+This writes `dist\PodpingGossipWatcher-<version>-setup.exe`, which installs
+both programs to `Program Files\PodpingGossipWatcher\`, adds a Start Menu
+shortcut, and registers an uninstaller. Tagging `vX.Y.Z` also builds the
+Windows installer in GitHub Actions and attaches it to the GitHub release.
+
 ## Peer discovery
 
 No DHT is used. Peer discovery is seed-based: 5 compiled-in podping.cloud
@@ -111,8 +134,7 @@ All configuration is via environment variables:
 | `SSE_BIND_ADDR` | `0.0.0.0:8089` | SSE listen address                                           |
 | `SSE_BUFFER_SIZE` | `1000` | SSE replay-buffer size                                       |
 | `NODE_FRIENDLY_NAME` | (unset) | Human-readable name shown to the rest of the swarm           |
-| `TRACE_FILE` | (unset) | Write debug tracing to this file instead of stderr |
-| `TRACE_FD3` | (off) | Unix only: set to `1` to trace via `/dev/fd/3` (use with `3>trace.log`) |
+| `TRACE_FD3` | (off) | Set to `1` to emit debug tracing on file descriptor 3        |
 
 ## Releases
 
