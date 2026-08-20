@@ -5,6 +5,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl-dev \
+        make \
         pkg-config \
         gcc-aarch64-linux-gnu \
         gcc-arm-linux-gnueabihf \
@@ -39,12 +40,25 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
     && cp "target/$RUST_TARGET/release/podping-gossipwatcher" target/release/podping-gossipwatcher
 
 FROM debian:trixie-slim AS runner
+ARG TARGETARCH
 
 USER root
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates openssl \
     && rm -rf /var/lib/apt/lists/*
+
+# Per-arch jemalloc tuning via /etc/malloc.conf symlink.
+#   arm   -> Pi 2  (1GB, A7):    1 arena, aggressive decay
+#   arm64 -> Pi 4  (2-8GB, A72): 2 arenas, quick decay
+#   amd64 -> midrange x64:       background purge + modest arena cap
+RUN case "$TARGETARCH" in \
+        arm)   CONF='background_thread:true,narenas:1,dirty_decay_ms:500,muzzy_decay_ms:0' ;; \
+        arm64) CONF='background_thread:true,narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:0' ;; \
+        amd64) CONF='background_thread:true,narenas:4' ;; \
+        *)     CONF='' ;; \
+    esac; \
+    if [ -n "$CONF" ]; then ln -s "$CONF" /etc/malloc.conf; fi
 
 RUN mkdir -p /data/gossip /opt/podping-gossipwatcher \
     && chown -R 1000:1000 /data /opt/podping-gossipwatcher

@@ -1,6 +1,13 @@
 mod archive;
 mod sse;
 
+// Use jemalloc on Linux. See Cargo.toml for rationale — glibc's per-thread
+// arena allocator leaks RSS under iroh-quinn's small-alloc churn, especially
+// on aarch64/armv7 hosts. jemalloc keeps RSS flat.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
