@@ -8,6 +8,7 @@ mod sse;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -56,14 +57,26 @@ const REBOOTSTRAP_TIMEOUT: u64 = 180;
 const REJOIN_INTERVAL_SECS: u64 = 1800; // Re-join peers every 30 minutes to prevent topology drift
 const ISOLATION_CHECK_INTERVAL_SECS: u64 = 300; // Check for topology isolation every 5 minutes
 const ISOLATION_MIN_UNIQUE_PEERS: usize = 3;    // Minimum unique source peers to consider healthy
-const ENDPOINT_RESET_AFTER_RECONNECTS: u32 = 3; // Create fresh endpoint after N consecutive reconnects
+const ENDPOINT_RESET_AFTER_RECONNECTS: u32 = 2; // Create fresh endpoint after N consecutive reconnects
 const RECONNECT_AFTER_FAILURES: u64 = 5;
 const RECONNECT_SHUTDOWN_TIMEOUT_SECS: u64 = 10; // Cap on old gossip actor shutdown during reconnect
 const RECONNECT_JOIN_TIMEOUT_SECS: u64 = 60;     // Cap on gossip re-join during reconnect; a hung join must not wedge the reconnect task
-const PERIODIC_RESET_INTERVAL_SECS: u64 = 12 * 3600; // Recycle iroh endpoint every 12h to bound memory growth
-const RSS_CEILING_BYTES: u64 = 1024 * 1024 * 1024;   // 1 GB RSS ceiling — safety valve for endpoint recycle
+const DEFAULT_PERIODIC_RESET_INTERVAL_SECS: u64 = 3600; // Recycle iroh endpoint hourly to bound iroh#4390 growth
+const CONN_DEDUP_INTERVAL_SECS: u64 = 30;
+const DEFAULT_RSS_CEILING_BYTES: u64 = 300 * 1024 * 1024; // endpoint recycle (MEMWATCH polls every 3s)
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
 const JOIN_PEERS_TIMEOUT_SECS: u64 = 10;
+/// QUIC multipath path budget per connection. iroh defaults to 8, which peers advertising
+/// unroutable candidate addresses (NAT-mapped IPv6, container/overlay ranges) exhaust
+/// routinely. Each exhausted path-open is re-queued unboundedly inside iroh's
+/// `pending_open_paths` (n0-computer/iroh#4390), so a larger budget starves that queue.
+const MULTIPATH_PATH_BUDGET: u32 = 24;
+/// Companion to `MULTIPATH_PATH_BUDGET`: how many NAT-traversal addresses a remote may
+/// advertise to us. Must be >= iroh's minimum of 8.
+const NAT_TRAVERSAL_ADDR_BUDGET: u8 = 24;
+/// Dedicated fast RSS watchdog interval. The iroh#4390 queue doubles every 333ms, so the
+/// 15-60s health poll cannot catch it before it blows the ceiling.
+const RSS_WATCHDOG_INTERVAL_SECS: u64 = 3;
 
 /// Shared sysinfo `System` instance. Kept across calls so CPU-usage deltas
 /// (which need at least two samples) work, and to avoid re-allocating on
@@ -136,6 +149,116 @@ fn open_trace_writer() -> Box<dyn std::io::Write + Send + Sync> {
 /// Read process resident set size in bytes. Returns 0 on failure.
 fn read_rss_bytes() -> u64 {
     with_self_process(|p| p.memory()).unwrap_or(0)
+}
+
+/// Reject duplicate gossip QUIC connections to the same peer. iroh#4390's queue growth
+/// multiplier requires >=2 connections per peer at the path-id cap; one gossip connection
+/// per remote keeps growth steady instead of exponential. Archive-sync ALPN is exempt.
+#[derive(Debug, Default)]
+struct DedupConnectionsHook {
+    active: Mutex<HashMap<iroh::EndpointId, iroh::endpoint::WeakConnectionHandle>>,
+}
+
+impl DedupConnectionsHook {
+    fn clear(&self) {
+        self.active.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    fn prune_and_count(&self) -> (usize, usize) {
+        let mut map = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        let before = map.len();
+        map.retain(|_, weak| weak.upgrade().is_some());
+        (before, map.len())
+    }
+}
+
+impl iroh::endpoint::EndpointHooks for DedupConnectionsHook {
+    async fn after_handshake(
+        &self,
+        conn: &iroh::endpoint::Connection,
+    ) -> iroh::endpoint::AfterHandshakeOutcome {
+        if conn.alpn() != iroh_gossip::ALPN {
+            return iroh::endpoint::AfterHandshakeOutcome::Accept;
+        }
+        let remote = conn.remote_id();
+        let mut map = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        map.retain(|_, weak| weak.upgrade().is_some());
+        if map.contains_key(&remote) {
+            eprintln!(
+                "\x1b[33m[CONN] Rejecting duplicate gossip connection from {remote} (iroh#4390 mitigation)\x1b[0m"
+            );
+            return iroh::endpoint::AfterHandshakeOutcome::Reject {
+                error_code: 1u32.into(),
+                reason: b"duplicate gossip connection".to_vec(),
+            };
+        }
+        map.insert(remote, conn.weak_handle());
+        iroh::endpoint::AfterHandshakeOutcome::Accept
+    }
+}
+
+/// Wrapper so the hook can live in an `Arc` and still be installed on the endpoint builder.
+#[derive(Debug, Clone)]
+struct SharedDedupHook(Arc<DedupConnectionsHook>);
+
+impl iroh::endpoint::EndpointHooks for SharedDedupHook {
+    async fn after_handshake(
+        &self,
+        conn: &iroh::endpoint::Connection,
+    ) -> iroh::endpoint::AfterHandshakeOutcome {
+        self.0.after_handshake(conn).await
+    }
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"),
+        Err(_) => default,
+    }
+}
+
+fn ipv4_only_addr_filter() -> iroh::address_lookup::AddrFilter {
+    iroh::address_lookup::AddrFilter::new(|addrs| {
+        Cow::Owned(
+            addrs
+                .iter()
+                .filter(|addr| match addr {
+                    iroh::TransportAddr::Ip(sa) => sa.is_ipv4(),
+                    _ => true,
+                })
+                .cloned()
+                .collect(),
+        )
+    })
+}
+
+/// Bind a fresh iroh endpoint. Both the initial bind and every recycle go through here so
+/// the multipath budget stays consistent; a recycled endpoint with iroh's default 8-path
+/// budget would start refilling `pending_open_paths` immediately.
+async fn bind_endpoint(
+    node_key: iroh::SecretKey,
+    dedup_hook: Arc<DedupConnectionsHook>,
+    ipv4_only: bool,
+) -> Result<iroh::Endpoint, anyhow::Error> {
+    let transport_config = iroh::endpoint::QuicTransportConfig::builder()
+        .max_concurrent_multipath_paths(MULTIPATH_PATH_BUDGET)
+        .max_remote_nat_traversal_addresses(NAT_TRAVERSAL_ADDR_BUDGET)
+        .build();
+    let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(node_key)
+        .transport_config(transport_config)
+        .hooks(SharedDedupHook(dedup_hook));
+    if ipv4_only {
+        builder = builder
+            .clear_ip_transports()
+            .bind_addr("0.0.0.0:0")
+            .map_err(|e| anyhow::anyhow!("bind_addr: {e}"))?
+            .addr_filter(ipv4_only_addr_filter());
+    }
+    builder
+        .bind()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind iroh endpoint: {e}"))
 }
 const ARCHIVE_SYNC_ALPN: &[u8] = b"/podping-archive-sync/1";
 const DEFAULT_SSE_BIND_ADDR: &str = "0.0.0.0:8089";
@@ -783,6 +906,15 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_SSE_BUFFER_SIZE);
+    let rss_ceiling_bytes: u64 = env::var("RSS_CEILING_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RSS_CEILING_BYTES);
+    let periodic_reset_interval_secs: u64 = env::var("ENDPOINT_RESET_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PERIODIC_RESET_INTERVAL_SECS);
+    let ipv4_only = env_flag("DISABLE_IPV6", false);
 
     let friendly_name: Option<String> = env::var("NODE_FRIENDLY_NAME")
         .ok()
@@ -801,6 +933,17 @@ async fn main() -> anyhow::Result<()> {
     println!("  Archive:      {}", if archive_enabled { &archive_path } else { "disabled" });
     println!("  Catch-up:     {}", if catchup_enabled { "enabled" } else { "disabled" });
     println!("  SSE:          {}", if sse_enabled { format!("{}", sse_bind_addr) } else { "disabled".to_string() });
+    let reset_label = if periodic_reset_interval_secs >= 3600 {
+        format!("{}h", periodic_reset_interval_secs / 3600)
+    } else {
+        format!("{}m", periodic_reset_interval_secs / 60)
+    };
+    println!(
+        "  RSS limits:   ceiling={}MB reset={} ipv4_only={}",
+        rss_ceiling_bytes / 1_048_576,
+        reset_label,
+        ipv4_only,
+    );
     if let Some(ref name) = friendly_name {
         println!("  Friendly name: {}", name);
     }
@@ -825,10 +968,8 @@ async fn main() -> anyhow::Result<()> {
     //Set up Iroh context
     let node_key = load_or_create_node_key(&node_key_file)?;
     let node_key_bytes = node_key.to_bytes();
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(node_key)
-        .bind()
-        .await?;
+    let dedup_hook = Arc::new(DedupConnectionsHook::default());
+    let endpoint = bind_endpoint(node_key, dedup_hook.clone(), ipv4_only).await?;
 
     // Create ed25519 signing key for peer_endorse messages (derived from node key)
     let signing_key = SigningKey::from_bytes(&node_key_bytes);
@@ -901,6 +1042,13 @@ async fn main() -> anyhow::Result<()> {
     // Track the current Gossip actor so reconnect can shut down the old one
     let shared_gossip: Arc<tokio::sync::RwLock<Gossip>> =
         Arc::new(tokio::sync::RwLock::new(gossip));
+
+    // Single owner of the live endpoint. Every long-lived consumer must read through this
+    // rather than capturing an `Endpoint` clone: iroh frees a `RemoteMap` (and the
+    // `pending_open_paths` queue that iroh#4390 grows) only when the *last* clone drops,
+    // so a stale clone anywhere makes an endpoint recycle unable to reclaim memory.
+    let shared_endpoint: Arc<tokio::sync::RwLock<iroh::Endpoint>> =
+        Arc::new(tokio::sync::RwLock::new(endpoint));
     let reconnect_count = Arc::new(AtomicU64::new(0));
     let neighbor_count = Arc::new(AtomicU32::new(0));
     let neighbor_ids: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
@@ -1135,7 +1283,7 @@ async fn main() -> anyhow::Result<()> {
         let reconnect_trusted_monitors = trusted_monitors.clone();
         let reconnect_shared = shared_sender.clone();
         let reconnect_gossip_handle = shared_gossip.clone();
-        let reconnect_endpoint = endpoint.clone();
+        let reconnect_endpoint = shared_endpoint.clone();
         let reconnect_node_key_bytes = node_key_bytes;
         let reconnect_bootstrap_ids = bootstrap_peer_ids_str.clone();
         let reconnect_peers_file = peers_file.clone();
@@ -1149,11 +1297,12 @@ async fn main() -> anyhow::Result<()> {
         let reconnect_sse_tx = sse_tx.clone();
         let reconnect_notif_count = notifications_received.clone();
         let reconnect_receive_generation = receive_generation.clone();
+        let reconnect_dedup_hook = dedup_hook.clone();
+        let reconnect_ipv4_only = ipv4_only;
         tokio::spawn(async move {
             // Keep the router alive in this task; on reconnect we replace it
             // (dropping the old router aborts its accept loop without closing the endpoint)
-            let mut _current_router = router;
-            let mut _current_endpoint = reconnect_endpoint.clone();
+            let mut _current_router = Some(router);
             let mut last_reconnect = std::time::Instant::now();
             let mut consecutive_reconnects: u32 = 0;
             loop {
@@ -1199,21 +1348,28 @@ async fn main() -> anyhow::Result<()> {
                             consecutive_reconnects
                         );
                         let node_key = iroh::SecretKey::from_bytes(&reconnect_node_key_bytes);
-                        match iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-                            .secret_key(node_key)
-                            .bind()
-                            .await
-                        {
+                        match bind_endpoint(node_key, reconnect_dedup_hook.clone(), reconnect_ipv4_only).await {
                             Ok(new_ep) => {
-                                // Close the old endpoint (non-blocking, best effort)
-                                let old_ep = _current_endpoint.clone();
+                                reconnect_dedup_hook.clear();
+                                // Swap the shared handle, then hand the old endpoint to a
+                                // task that owns the last strong reference: closing it is
+                                // best-effort, but the `drop` at the end of that task is
+                                // what actually reclaims its RemoteMap. Dropping the old
+                                // router first releases the clone it holds.
+                                // Drop the old router first — it holds an endpoint clone,
+                                // and any surviving clone keeps the old RemoteMap alive.
+                                drop(_current_router.take());
+                                let old_ep = {
+                                    let mut guard = reconnect_endpoint.write().await;
+                                    std::mem::replace(&mut *guard, new_ep)
+                                };
                                 tokio::spawn(async move {
                                     tokio::time::timeout(
                                         std::time::Duration::from_secs(5),
                                         old_ep.close(),
                                     ).await.ok();
+                                    drop(old_ep);
                                 });
-                                _current_endpoint = new_ep;
                                 eprintln!("\x1b[32m[RECONNECT] Fresh endpoint created successfully.\x1b[0m");
                             }
                             Err(e) => {
@@ -1237,11 +1393,12 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     // Spawn a fresh Gossip actor on the current endpoint
+                    let current_endpoint = reconnect_endpoint.read().await.clone();
                     let new_gossip = Gossip::builder()
                         .max_message_size(65536)
-                        .spawn(_current_endpoint.clone());
+                        .spawn(current_endpoint.clone());
                     // Re-register the new gossip (and archive sync if active) with a fresh Router
-                    let mut new_router_builder = Router::builder(_current_endpoint.clone())
+                    let mut new_router_builder = Router::builder(current_endpoint)
                         .accept(iroh_gossip::ALPN, new_gossip.clone());
                     if let Some(ref db_arc) = reconnect_db {
                         let handler = ArchiveSyncHandler { db: db_arc.clone() };
@@ -1249,7 +1406,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     // Replace the router: dropping the old one stops its accept loop,
                     // the new one routes incoming connections to the fresh actor
-                    _current_router = new_router_builder.spawn();
+                    drop(_current_router.take());
+                    _current_router = Some(new_router_builder.spawn());
                     // Time-capped (kept from v0.11.1): subscribe is near-instant, but the
                     // cap guards a sick gossip actor/endpoint from wedging this task.
                     let bootstrap_peers = gather_bootstrap_peers(
@@ -1389,6 +1547,7 @@ async fn main() -> anyhow::Result<()> {
         let h_force_reset = force_endpoint_reset.clone();
         let h_reconnect_requested = reconnect_requested.clone();
         let h_reconnect_notify = reconnect_notify.clone();
+        let periodic_reset_secs = periodic_reset_interval_secs;
         tokio::spawn(async move {
             let mut prev_notifs: u64 = 0;
             let mut prev_failures: u64 = 0;
@@ -1417,14 +1576,22 @@ async fn main() -> anyhow::Result<()> {
                     status, delta_notifs, delta_failures, since_last, rss_bytes / 1_048_576,
                 );
 
-                // Memory-bounded endpoint recycle: time-based (12h) + RSS-ceiling safety valve
-                let time_elapsed = last_reset.elapsed() >= std::time::Duration::from_secs(PERIODIC_RESET_INTERVAL_SECS);
-                let rss_exceeded = rss_bytes > RSS_CEILING_BYTES;
+                // Memory-bounded endpoint recycle: time-based + RSS-ceiling safety valve
+                let time_elapsed = last_reset.elapsed()
+                    >= std::time::Duration::from_secs(periodic_reset_secs);
+                let rss_exceeded = rss_bytes > rss_ceiling_bytes;
                 if time_elapsed || rss_exceeded {
                     let reason = if rss_exceeded {
-                        format!("RSS {}MB exceeds ceiling {}MB", rss_bytes / 1_048_576, RSS_CEILING_BYTES / 1_048_576)
+                        format!(
+                            "RSS {}MB exceeds ceiling {}MB",
+                            rss_bytes / 1_048_576,
+                            rss_ceiling_bytes / 1_048_576,
+                        )
                     } else {
-                        format!("{}h elapsed since last reset", last_reset.elapsed().as_secs() / 3600)
+                        format!(
+                            "{}s elapsed since last reset",
+                            last_reset.elapsed().as_secs()
+                        )
                     };
                     eprintln!("\x1b[1;35m[HEALTH] Triggering endpoint reset — {}\x1b[0m", reason);
                     h_force_reset.store(true, Ordering::Relaxed);
@@ -1439,13 +1606,73 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Periodic connection-dedup inventory. The hook rejects new duplicates at handshake
+    // time; this task logs how many live weak handles remain so stale entries are visible.
+    {
+        let dedup_monitor = dedup_hook.clone();
+        let dedup_shutdown = shutdown_flag.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(CONN_DEDUP_INTERVAL_SECS)).await;
+                if dedup_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                let (before, after) = dedup_monitor.prune_and_count();
+                if before != after {
+                    eprintln!(
+                        "\x1b[90m[CONN] Pruned {} stale connection handle(s); {} peer(s) tracked\x1b[0m",
+                        before.saturating_sub(after),
+                        after,
+                    );
+                }
+            }
+        });
+    }
+
+    // Fast RSS watchdog. The iroh#4390 queue doubles roughly every 333ms, so the health
+    // loop above (15-60s) can miss the entire climb from healthy to OOM between two polls.
+    // This only watches the ceiling and trips a recycle; diagnostics stay in the health loop.
+    {
+        let w_force_reset = force_endpoint_reset.clone();
+        let w_reconnect_requested = reconnect_requested.clone();
+        let w_reconnect_notify = reconnect_notify.clone();
+        let w_shutdown = shutdown_flag.clone();
+        tokio::spawn(async move {
+            let mut tripped_at: Option<std::time::Instant> = None;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(RSS_WATCHDOG_INTERVAL_SECS)).await;
+                if w_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Give a previously requested recycle time to land before asking again.
+                if tripped_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60)) {
+                    continue;
+                }
+                let rss_bytes = read_rss_bytes();
+                if rss_bytes <= rss_ceiling_bytes {
+                    tripped_at = None;
+                    continue;
+                }
+                eprintln!(
+                    "\x1b[1;35m[MEMWATCH] RSS {}MB exceeds ceiling {}MB — forcing endpoint recycle\x1b[0m",
+                    rss_bytes / 1_048_576,
+                    rss_ceiling_bytes / 1_048_576,
+                );
+                w_force_reset.store(true, Ordering::Relaxed);
+                w_reconnect_requested.store(true, Ordering::Relaxed);
+                w_reconnect_notify.notify_one();
+                tripped_at = Some(std::time::Instant::now());
+            }
+        });
+    }
+
     println!(
         "\n  Listening for gossip notifications. This will take a minute. Patience grasshopper...\n"
     );
 
     // Channel for forwarding NeighborUp to catch-up task (if enabled)
     let neighbor_tx_for_event: Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>> = if catchup_enabled {
-        let catchup_endpoint = endpoint.clone();
+        let catchup_endpoint = shared_endpoint.clone();
         let catchup_peers_file = peers_file.clone();
         let catchup_bootstrap_str = bootstrap_peer_ids_str.clone();
         let catchup_trusted = trusted_publishers.clone();
@@ -1470,6 +1697,10 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            // Clone the live endpoint for the duration of catch-up only. Catch-up is
+            // one-shot, so this clone is released when the task ends and never blocks a
+            // later endpoint recycle from reclaiming memory.
+            let catchup_endpoint = catchup_endpoint.read().await.clone();
             run_catchup(
                 &catchup_endpoint,
                 since,
@@ -1526,7 +1757,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::pin!(shutdown_deadline);
 
     tokio::select! {
-        _ = endpoint.close() => {
+        _ = async {
+            let ep = shared_endpoint.read().await.clone();
+            ep.close().await;
+        } => {
             println!("[info] Clean shutdown complete.");
         }
         _ = &mut shutdown_deadline => {

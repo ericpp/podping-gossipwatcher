@@ -26,6 +26,8 @@ known peers if no notification arrives within 180 seconds.
 
 ```sh
 docker run -d --name gossip-watcher \
+  --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+  --sysctl net.ipv6.conf.default.disable_ipv6=1 \
   -v $(pwd)/data:/data/gossip \
   -e NODE_FRIENDLY_NAME="MySpecialPodcastNode"
   -e IROH_NODE_KEY_FILE=/data/gossip/node.key \

@@ -71,6 +71,13 @@ RUN mkdir -p /data && chown 1000:1000 /data
 WORKDIR /data
 
 ENV SSE_ENABLED=1
+# Mitigate iroh#4390 (pending_open_paths unbounded growth in containers):
+# - IPv4-only bind + addr_filter avoids unroutable v6 candidate churn
+# - Hourly endpoint recycle + 3s RSS watchdog enforce in-app (see main.rs)
+# Also pass at runtime: docker run --sysctl net.ipv6.conf.all.disable_ipv6=1 ...
+ENV DISABLE_IPV6=1
+ENV ENDPOINT_RESET_INTERVAL_SECS=3600
+ENV RSS_CEILING_BYTES=314572800
 
 USER 1000
 EXPOSE 8089
